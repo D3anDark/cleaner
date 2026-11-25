@@ -68,7 +68,7 @@ pub type Args = Vec<String>;
 /// Not cached: after brew is installed mid-session, R finds it.
 pub fn program() -> Option<PathBuf> {
     let on_path: Vec<PathBuf> = std::env::var_os("PATH").map(|path| std::env::split_paths(&path).map(|folder| folder.join("brew")).collect()).unwrap_or_default();
-    on_path.into_iter().chain(["/opt/homebrew/bin/brew", "/usr/local/bin/brew"].map(PathBuf::from)).find(|path| path.is_file())
+    on_path.into_iter().chain(["/opt/homebrew/bin/brew", "/usr/local/bin/brew", "/home/linuxbrew/.linuxbrew/bin/brew"].map(PathBuf::from)).find(|path| path.is_file())
 }
 
 const MISSING: &str = "Homebrew is not installed. Get it at https://brew.sh, then press R.";

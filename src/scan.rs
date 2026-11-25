@@ -2,6 +2,7 @@ use crate::apps::{self, App, Index};
 use crate::matcher::{self, Collisions, Descriptor, Kind, Strength};
 use crate::size;
 use std::collections::HashSet;
+#[cfg(target_os = "macos")]
 use std::ffi::CStr;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -44,6 +45,9 @@ const CATEGORY_ORDER: &[&str] = &[
     "WebKit",
     "LaunchAgents",
     "LaunchDaemons",
+    "Autostart",
+    "User Services",
+    "Launchers",
     "Application Scripts",
     "Internet Plug-Ins",
     "PreferencePanes",
@@ -184,6 +188,8 @@ const UNIX_TOOLS: &[(&str, &str, usize)] = &[
     spec("Command Line Tools", "/usr/local/sbin", 1),
     spec("Command Line Tools", "/opt/homebrew/bin", 1),
     spec("Command Line Tools", "/opt/homebrew/sbin", 1),
+    spec("Command Line Tools", "/home/linuxbrew/.linuxbrew/bin", 1),
+    spec("Command Line Tools", "/home/linuxbrew/.linuxbrew/sbin", 1),
     spec("Shell Completions", "/usr/local/share/zsh/site-functions", 1),
     spec("Shell Completions", "/usr/local/share/fish/vendor_completions.d", 1),
     spec("Shell Completions", "/usr/local/share/bash-completion/completions", 1),
@@ -192,7 +198,15 @@ const UNIX_TOOLS: &[(&str, &str, usize)] = &[
     spec("Shell Completions", "/opt/homebrew/share/bash-completion/completions", 1),
 ];
 
+#[cfg(target_os = "macos")]
 const SYSTEM_DATA: &[(&str, &str, usize)] = &[spec("Configuration", "/private/etc", 1), spec("Logs", "/private/var/log", 1)];
+#[cfg(target_os = "linux")]
+const SYSTEM_DATA: &[(&str, &str, usize)] = &[spec("Configuration", "/etc", 1), spec("Logs", "/var/log", 1)];
+
+/// Where Linux apps register themselves with the desktop, below the home folder.
+#[cfg(target_os = "linux")]
+const LINUX_HOME: &[(&str, &str, usize)] =
+    &[spec("Launchers", ".local/share/applications", 1), spec("Autostart", ".config/autostart", 1), spec("User Services", ".config/systemd/user", 1), spec("Command Line Tools", ".local/bin", 1)];
 
 /// Data apps share between users, and the receipts `pkgutil --pkgs` reads.
 const APP_SCAN_ONLY: &[(&str, &str, usize)] = &[spec("Shared", "/Users/Shared", 2), spec("Installer Receipts", "/private/var/db/receipts", 1)];
@@ -204,7 +218,8 @@ fn build(root: &Path, specs: &[(&'static str, &str, usize)], system: bool, out: 
             let resolves_container = category.ends_with("Containers");
             // Package managers own most of bin and completions; links into the bundle come from `cli_links`, selected.
             // /Users/Shared holds user content apps point at, such as Parallels VMs and sample libraries.
-            let auto_selectable = !matches!(category, "Fonts" | "Command Line Tools" | "Shell Completions" | "Shared");
+            // An app's own launcher is its Application row; a name hit among the rest is another app's (claude-code-url-handler for Code).
+            let auto_selectable = !matches!(category, "Fonts" | "Command Line Tools" | "Shell Completions" | "Shared" | "Launchers");
             out.push(Location { category, path, system, depth, resolves_container, auto_selectable, hidden_only: false });
         }
     }
@@ -231,14 +246,24 @@ fn app_locations(include_system: bool) -> Vec<Location> {
     let mut out = locations(include_system);
     system_library(&mut out);
     build(Path::new("/"), APP_SCAN_ONLY, true, &mut out);
+    #[cfg(target_os = "linux")]
+    build(&home(), LINUX_HOME, false, &mut out);
     out.extend(home_and_temp_locations());
     out
+}
+
+/// An XDG folder inside the home folder. An inherited XDG_DATA_HOME=/ would point an auto-selecting walk at the whole disk.
+pub fn xdg(variable: &str, fallback: &str) -> PathBuf {
+    let home = home();
+    let path = std::env::var(variable).ok().map(PathBuf::from).filter(|path| path.starts_with(&home) && path != &home && !path.components().any(|c| c.as_os_str() == ".."));
+    path.unwrap_or_else(|| home.join(fallback))
 }
 
 /// Per-user temp folders, XDG folders and home dot-folders, where CLIs and cross-platform apps write.
 fn home_and_temp_locations() -> Vec<Location> {
     let home = home();
     let mut paths: Vec<(&'static str, PathBuf, bool)> = Vec::new();
+    #[cfg(target_os = "macos")]
     for name in [libc::_CS_DARWIN_USER_CACHE_DIR, libc::_CS_DARWIN_USER_TEMP_DIR] {
         if let Some(path) = confstr(name) {
             paths.push(("Temporary", path, false));
@@ -254,12 +279,10 @@ fn home_and_temp_locations() -> Vec<Location> {
         ("XDG_DATA_HOME", ".local/share", "Application Support"),
         ("XDG_STATE_HOME", ".local/state", "Application Support"),
     ] {
-        // An inherited XDG_DATA_HOME=/ would point an auto-selecting walk at the whole disk.
-        let path = std::env::var(variable).ok().map(PathBuf::from).filter(|path| path.starts_with(&home) && path != &home && !path.components().any(|c| c.as_os_str() == ".."));
-        paths.push((category, path.unwrap_or_else(|| home.join(fallback)), false));
+        paths.push((category, xdg(variable, fallback), false));
     }
     paths.push(("Application Support", home.join(".var/app"), false));
-    paths.push(("Temporary", PathBuf::from("/private/tmp"), false));
+    paths.push(("Temporary", PathBuf::from(if cfg!(target_os = "macos") { "/private/tmp" } else { "/tmp" }), false));
 
     let mut out: Vec<Location> = Vec::new();
     for (category, path, hidden_only) in paths {
@@ -271,6 +294,7 @@ fn home_and_temp_locations() -> Vec<Location> {
     out
 }
 
+#[cfg(target_os = "macos")]
 fn confstr(name: libc::c_int) -> Option<PathBuf> {
     let mut buffer = [0 as libc::c_char; 1024];
     // SAFETY: confstr writes at most buffer.len() bytes, null-terminated, into the buffer.
@@ -310,6 +334,8 @@ pub fn leftovers(app: &App, installed: &[App], include_system: bool) -> Vec<File
         found
     }));
     items.extend(cli_links(&app.path));
+    #[cfg(target_os = "linux")]
+    items.extend(launched_program(app));
     // Across the whole disk an executable or bundle name ("Electron", "Code") names too much: display name only.
     let named = Descriptor::new(descriptor.ids.iter().map(String::as_str), [app.name.as_str()]);
     items.extend(elsewhere(&named, &locations));
@@ -388,6 +414,19 @@ fn cli_links(app_path: &Path) -> Vec<FileItem> {
     items
 }
 
+/// The program a launcher of the user's own starts from the home folder, such as an AppImage: the app
+/// itself, selected only when it is an AppImage, since a launcher can also start a shared binary.
+#[cfg(target_os = "linux")]
+fn launched_program(app: &App) -> Option<FileItem> {
+    if app.is_system {
+        return None;
+    }
+    let program = apps::which(&apps::launcher_program(&app.path)?)?;
+    let appimage = program.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("appimage"));
+    let fits = program.starts_with(home()) && std::fs::symlink_metadata(&program).is_ok_and(|meta| meta.is_file()) && !matcher::is_protected(&program);
+    fits.then(|| FileItem { why: "the program the launcher starts", ..FileItem::new(program, "Application", false, appimage) })
+}
+
 /// Cloud folders list their files from the network: a walk would download folder listings.
 const CLOUD_FOLDERS: &[&str] = &["Library/CloudStorage", "Library/Mobile Documents"];
 /// Dependency trees and build output: millions of files, none an app's.
@@ -395,7 +434,13 @@ const BUILD_FOLDERS: &[&str] = &["node_modules", "target"];
 
 /// /System/Volumes/Data mirrors the data volume the walk reaches through /Users and the rest, /Volumes
 /// holds mounted disks such as an app's own DMG, and only macOS removes a staged system extension.
+#[cfg(target_os = "macos")]
 const DISK_SKIP: &[&str] = &["/System", "/Volumes", "/Library/SystemExtensions"];
+/// Kernel and runtime trees, mounted media, and what package managers own: their files carry app ids
+/// (icons, metainfo, flatpak deploys) but go with the package, never to the Trash.
+#[cfg(target_os = "linux")]
+const DISK_SKIP: &[&str] =
+    &["/proc", "/sys", "/dev", "/run", "/boot", "/usr", "/mnt", "/media", "/snap", "/var/lib/flatpak", "/var/lib/snapd", "/var/lib/dnf", "/var/lib/rpm", "/var/lib/dpkg", "/var/lib/pacman"];
 
 /// Every folder of the startup disk the locations miss, for the app's bundle id or exact name. Hits stay
 /// unselected: Apple daemons file per-app records under bundle ids too (`~/Library/Biome`).
@@ -404,6 +449,7 @@ fn elsewhere(app: &Descriptor, locations: &[Location]) -> Vec<FileItem> {
     let Ok(disk) = std::fs::metadata(&home).map(|meta| meta.dev()) else { return vec![] };
     let mut skip: HashSet<PathBuf> = DISK_SKIP.iter().map(PathBuf::from).collect();
     skip.extend(CLOUD_FOLDERS.iter().map(|folder| home.join(folder)));
+    skip.insert(xdg("XDG_DATA_HOME", ".local/share").join("flatpak"));
     for location in locations.iter().filter(|location| !location.hidden_only) {
         skip.insert(location.path.clone());
         skip.extend(std::fs::canonicalize(&location.path));
@@ -578,6 +624,8 @@ pub fn junk(include_system: bool) -> Vec<FileItem> {
     let home = home();
     let mut catalog = vec![
         ("User Caches", home.join("Library/Caches"), false, Mode::Contents, true),
+        #[cfg(target_os = "linux")]
+        ("User Caches", xdg("XDG_CACHE_HOME", ".cache"), false, Mode::Contents, true),
         ("Saved Application State", home.join("Library/Saved Application State"), false, Mode::Contents, true),
         ("User Logs", home.join("Library/Logs"), false, Mode::Contents, true),
         ("iOS Backups", home.join("Library/Application Support/MobileSync/Backup"), false, Mode::Contents, false),
@@ -588,9 +636,10 @@ pub fn junk(include_system: bool) -> Vec<FileItem> {
             catalog.push(("Developer", path, false, Mode::Whole, safe));
         }
     }
+    let editors = if cfg!(target_os = "macos") { home.join("Library/Application Support") } else { xdg("XDG_CONFIG_HOME", ".config") };
     for editor in ELECTRON_EDITORS {
         for cache in ELECTRON_CACHES {
-            catalog.push(("Developer", home.join("Library/Application Support").join(editor).join(cache), false, Mode::Whole, true));
+            catalog.push(("Developer", editors.join(editor).join(cache), false, Mode::Whole, true));
         }
     }
     let mut targets = Vec::new();
@@ -601,6 +650,8 @@ pub fn junk(include_system: bool) -> Vec<FileItem> {
     if include_system {
         catalog.push(("System Caches", PathBuf::from("/Library/Caches"), true, Mode::Contents, false));
         catalog.push(("System Logs", PathBuf::from("/Library/Logs"), true, Mode::Contents, false));
+        #[cfg(target_os = "linux")]
+        catalog.push(("System Caches", PathBuf::from("/var/cache"), true, Mode::Contents, false));
     }
 
     let mut items = Vec::new();
@@ -673,6 +724,35 @@ const VENDOR_ALLOWLIST: &[&str] = &[
     "steam",
     "epicgames",
     "discord",
+    // Linux: desktop state and personal data stores no menu entry or command is named after.
+    "trash",
+    "keyrings",
+    "kwalletd",
+    "localmail",
+    "contacts",
+    "baloo",
+    "session",
+    "autostart",
+    "applications",
+    "flatpak",
+    "apps",
+    "electron",
+    "procps",
+    "enchant",
+    "kvantum",
+    "qt5ct",
+    "qt6ct",
+    "kdedefaults",
+    "kscreen",
+    "klipper",
+    "knewstuff3",
+    "kpeoplevcard",
+    "libkunitconversion",
+    "libaccountsglib",
+    "gvfsmetadata",
+    "qtvirtualkeyboard",
+    "cosmic",
+    "cosmiccomp",
 ];
 
 const HIGH: &str = "Orphans (High confidence)";
@@ -717,6 +797,8 @@ pub fn orphans(installed: &[App], include_system: bool) -> Vec<FileItem> {
             }
         }
     }
+    #[cfg(target_os = "linux")]
+    linux_orphans(&index, &mut items);
     let mut seen = HashSet::new();
     items.retain(|item| seen.insert(item.path.clone()));
     measure(&mut items);
@@ -724,16 +806,69 @@ pub fn orphans(installed: &[App], include_system: bool) -> Vec<FileItem> {
     items
 }
 
+/// Linux adds what its own layout tells: data of a flatpak no longer installed and launchers whose
+/// program is gone, then the XDG folders, graded like the macOS ones.
+#[cfg(target_os = "linux")]
+fn linux_orphans(index: &Index, items: &mut Vec<FileItem>) {
+    let (config, data) = (xdg("XDG_CONFIG_HOME", ".config"), xdg("XDG_DATA_HOME", ".local/share"));
+    let read = |folder: &Path| std::fs::read_dir(folder).into_iter().flatten().flatten().filter(|entry| !entry.file_name().to_string_lossy().starts_with('.') && !matcher::is_protected(&entry.path()));
+    // `flatpak uninstall` leaves the app's data in ~/.var/app/<id> unless asked to delete it.
+    let flatpaks = [PathBuf::from("/var/lib/flatpak/app"), data.join("flatpak/app")];
+    for entry in read(&home().join(".var/app")) {
+        if !flatpaks.iter().any(|root| root.join(entry.file_name()).exists()) {
+            items.push(FileItem { auto_selectable: true, ..FileItem::new(entry.path(), HIGH, false, false) });
+        }
+    }
+    // A missing absolute path is certain; a bare name off this process's PATH may be on the session's.
+    for entry in read(&config.join("autostart")).chain(read(&data.join("applications"))) {
+        let path = entry.path();
+        let Some(program) = path.extension().is_some_and(|ext| ext == "desktop").then(|| apps::launcher_program(&path)).flatten() else { continue };
+        if apps::which(&program).is_none() {
+            let category = if program.starts_with('/') { HIGH } else { MEDIUM };
+            items.push(FileItem { auto_selectable: category == HIGH, ..FileItem::new(path, category, false, false) });
+        }
+    }
+    for (category, folder) in [("Configuration", config), ("Application Support", data), ("Application Support", xdg("XDG_STATE_HOME", ".local/state")), ("Caches", xdg("XDG_CACHE_HOME", ".cache"))] {
+        for entry in read(&folder) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+            if let Some(confidence) = orphan_confidence(&name, &name, is_dir, category, index) {
+                items.push(FileItem::new(entry.path(), confidence, false, false));
+            }
+        }
+    }
+}
+
+/// A command, or a folder in /usr/share, /usr/lib and the like, named like the candidate: an installed
+/// package writes it (`~/.config/pipewire`, `~/.config/nvim`), with or without a menu entry.
+#[cfg(target_os = "linux")]
+fn installed_by_name(name: &str) -> bool {
+    let system = ["/usr/share", "/usr/lib", "/usr/lib64", "/usr/libexec", "/etc", "/etc/xdg", "/opt"].map(Path::new);
+    let lower = name.to_lowercase();
+    [name, lower.as_str()].into_iter().any(|name| apps::which(name).is_some() || system.iter().any(|folder| folder.join(name).exists()))
+}
+
 fn orphan_confidence(name: &str, identifier: &str, is_dir: bool, category: &str, index: &Index) -> Option<&'static str> {
+    #[cfg(target_os = "linux")]
+    if installed_by_name(name) {
+        return None;
+    }
     if is_reverse_dns(identifier) {
         return (!index.owns_identifier(identifier) && !index.matches_name(identifier)).then_some(MEDIUM);
     }
     let normalized = matcher::normalize(name);
-    let app_named = category == "Application Support" && is_dir && normalized.chars().count() >= 4 && !VENDOR_ALLOWLIST.contains(&normalized.as_str());
+    // Configuration comes only from the Linux XDG folder: on macOS it is /etc, which this scan skips.
+    let app_named = matches!(category, "Application Support" | "Configuration") && is_dir && normalized.chars().count() >= 4 && !VENDOR_ALLOWLIST.contains(&normalized.as_str());
     (app_named && !index.matches_name(name)).then_some(LOW)
 }
 
+/// On Linux `mimeapps.list` and `dnf5.log.1` have dots too, so there a reverse-DNS name also needs
+/// three parts and a lowercase top-level domain first.
 fn is_reverse_dns(text: &str) -> bool {
+    if cfg!(target_os = "linux") {
+        let mut parts = text.split('.');
+        return parts.next().is_some_and(|tld| (2..=6).contains(&tld.len()) && tld.bytes().all(|byte| byte.is_ascii_lowercase())) && parts.count() >= 2;
+    }
     text.find('.').is_some_and(|dot| dot > 0)
 }
 
@@ -746,6 +881,7 @@ pub fn program_path(plist_path: &Path) -> Option<String> {
     program.filter(|program| !program.is_empty()).map(str::to_owned)
 }
 
+#[cfg(target_os = "macos")]
 pub fn launchd_label(plist_path: &Path) -> Option<String> {
     let value = plist::Value::from_file(plist_path).ok()?;
     let label = value.as_dictionary()?.get("Label")?.as_string()?;
@@ -835,6 +971,28 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_app_scan_keeps_etc_behind_the_toggle() {
+        let at = |locations: Vec<Location>, path: &str| locations.iter().any(|location| location.path == Path::new(path) && location.system);
+        assert!(!at(app_locations(false), "/etc"));
+        assert!(at(app_locations(true), "/etc"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_orphans_skip_what_an_installed_package_names() {
+        let index = Index::new(&[]);
+        assert_eq!(orphan_confidence("sh", "sh", true, "Configuration", &index), None, "a command on PATH");
+        assert_eq!(orphan_confidence("Gone App", "Gone App", true, "Configuration", &index), Some(LOW));
+        assert_eq!(orphan_confidence("keyrings", "keyrings", true, "Application Support", &index), None);
+        assert_eq!(orphan_confidence("com.gone.App", "com.gone.App", true, "Caches", &index), Some(MEDIUM));
+        for file in ["mimeapps.list", "dnf5.log.1", "kde.org", "UserFeedback.org.kde.plasmashell"] {
+            assert!(!is_reverse_dns(file), "{file}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
     fn app_scan_always_covers_library_but_keeps_etc_behind_the_toggle() {
         let locations = app_locations(false);
         let at = |path: &str| locations.iter().find(|location| location.path == Path::new(path));

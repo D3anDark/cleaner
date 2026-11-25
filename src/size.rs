@@ -1,16 +1,24 @@
 use std::collections::HashSet;
+#[cfg(target_os = "macos")]
 use std::ffi::OsStr;
+#[cfg(target_os = "macos")]
 use std::fs::{File, OpenOptions};
+#[cfg(target_os = "macos")]
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
 /// Per-entry error code, valid only in bulk calls; libc does not define it.
+#[cfg(target_os = "macos")]
 const ATTR_CMN_ERROR: u32 = 0x2000_0000;
+#[cfg(target_os = "macos")]
 const VREG: u32 = 1;
+#[cfg(target_os = "macos")]
 const VDIR: u32 = 2;
 /// More threads stop paying off on APFS: on an M1 Max, 8 threads and 16 measured the same.
 const MAX_THREADS: usize = 8;
@@ -85,6 +93,7 @@ pub fn sizes(paths: &[PathBuf]) -> Vec<(u64, bool)> {
 
 /// Sums one folder's files and adds its subfolders to `found`. One `getattrlistbulk` call fills a
 /// buffer where `readdir` needs an `lstat` per entry: ~/Library/Developer took 1.3 s instead of 2.3 s.
+#[cfg(target_os = "macos")]
 fn read_folder(folder: &Folder, buffer: &mut [u8], found: &mut Vec<Folder>, linked: &Mutex<HashSet<(usize, u64)>>) -> (u64, bool) {
     let Ok(dir) = OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(&folder.path) else { return (0, false) };
     let Ok(meta) = File::metadata(&dir) else { return (0, false) };
@@ -150,7 +159,47 @@ fn read_folder(folder: &Folder, buffer: &mut [u8], found: &mut Vec<Folder>, link
     }
 }
 
+/// Linux has no bulk call: `readdir`, then one `lstat` per entry. The buffer is the macOS one, never touched here.
+#[cfg(target_os = "linux")]
+fn read_folder(folder: &Folder, _buffer: &mut [u8], found: &mut Vec<Folder>, linked: &Mutex<HashSet<(usize, u64)>>) -> (u64, bool) {
+    match std::fs::symlink_metadata(&folder.path) {
+        Ok(meta) if meta.is_dir() && meta.dev() == folder.device => {}
+        Ok(_) => return (0, true),
+        Err(_) => return (0, false),
+    }
+    let Ok(entries) = std::fs::read_dir(&folder.path) else { return (0, false) };
+    let (mut bytes, mut readable) = (0, true);
+    for entry in entries {
+        // DirEntry::metadata does not follow links on Unix, so a link counts 0.
+        let Ok((path, meta)) = entry.and_then(|entry| Ok((entry.path(), entry.metadata()?))) else {
+            readable = false;
+            continue;
+        };
+        if meta.is_dir() {
+            found.push(Folder { item: folder.item, path, device: folder.device });
+        } else if meta.is_file() && (meta.nlink() < 2 || linked.lock().unwrap().insert((folder.item, meta.ino()))) {
+            bytes += meta.blocks() * 512;
+        }
+    }
+    (bytes, readable)
+}
+
 /// The home volume's size and the bytes still free for the user, as `df` shows them.
+#[cfg(target_os = "linux")]
+pub fn disk_space() -> Option<(u64, u64)> {
+    let home = std::ffi::CString::new(crate::scan::home().as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs is plain data.
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: home is NUL-terminated and stats is a writable statvfs.
+    if unsafe { libc::statvfs(home.as_ptr(), &mut stats) } != 0 {
+        return None;
+    }
+    let block = stats.f_frsize as u64;
+    Some((stats.f_blocks as u64 * block, stats.f_bavail as u64 * block))
+}
+
+/// The home volume's size and the bytes still free for the user, as `df` shows them.
+#[cfg(target_os = "macos")]
 pub fn disk_space() -> Option<(u64, u64)> {
     let home = std::ffi::CString::new(crate::scan::home().as_os_str().as_bytes()).ok()?;
     // SAFETY: statfs is plain data.
@@ -164,6 +213,7 @@ pub fn disk_space() -> Option<(u64, u64)> {
 }
 
 /// A plain-data field of a `getattrlistbulk` buffer, which packs fields without alignment.
+#[cfg(target_os = "macos")]
 fn read<T: Copy>(buffer: &[u8], at: usize) -> T {
     let bytes = &buffer[at..at + size_of::<T>()];
     // SAFETY: `bytes` holds size_of::<T>() initialized bytes, and every T read here is integers only.

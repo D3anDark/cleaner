@@ -427,7 +427,7 @@ impl App {
         std::thread::spawn(move || {
             let mut apps = apps::installed();
             tx.send(Msg::Apps(apps.clone()))?;
-            let paths: Vec<_> = apps.iter().map(|app| app.path.clone()).collect();
+            let paths: Vec<_> = apps.iter().map(apps::payload).collect();
             for (app, (size, _)) in apps.iter_mut().zip(size::sizes(&paths)) {
                 app.size = Some(size);
             }
@@ -819,7 +819,7 @@ impl App {
                     Some(Row::Group(range)) => folder(&items[range.clone()]),
                     None => return,
                 };
-                let _ = Command::new("open").arg("-R").arg(path).spawn();
+                reveal(&path);
             }
             KeyCode::Char('d') | KeyCode::Delete if deletable => self.confirm = Some(Confirm::Trash(target)),
             _ => list.cursor = step(list.cursor, rows.len(), code),
@@ -1040,7 +1040,7 @@ impl App {
             self.status = "No web page to open.".into();
             return;
         }
-        let _ = Command::new("open").arg(url).spawn();
+        launch(Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" }).arg(url));
     }
 
     fn remove_selected(&mut self, target: Target) {
@@ -1156,7 +1156,37 @@ fn step(cursor: usize, count: usize, code: KeyCode) -> usize {
     }
 }
 
+/// Shows the item in its folder: Finder selects it, Linux has no common way to select, so its folder opens.
+fn reveal(path: &Path) {
+    if cfg!(target_os = "macos") {
+        launch(Command::new("open").arg("-R").arg(path));
+    } else if let Some(folder) = path.parent() {
+        launch(Command::new("xdg-open").arg(folder));
+    }
+}
+
+/// Starts a desktop helper without a word on the TUI (xdg-open passes on its helpers' warnings) and
+/// reaps it on a thread of its own, which ends with the helper.
+fn launch(command: &mut Command) {
+    use std::process::Stdio;
+    if let Ok(mut child) = command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+        std::thread::spawn(move || child.wait());
+    }
+}
+
+/// Stops and disables the app's own systemd user units before their files go, so they stop running now.
+#[cfg(target_os = "linux")]
+fn stop_agents<'a>(items: impl Iterator<Item = &'a FileItem>) {
+    let units = scan::xdg("XDG_CONFIG_HOME", ".config").join("systemd/user");
+    for item in items.filter(|item| item.path.parent() == Some(units.as_path())) {
+        if let Some(unit) = item.path.file_name() {
+            let _ = Command::new("systemctl").args(["--user", "disable", "--now", "--"]).arg(unit).output();
+        }
+    }
+}
+
 /// Unloads the app's own launch agents before their plists go, so they stop running now.
+#[cfg(target_os = "macos")]
 fn stop_agents<'a>(items: impl Iterator<Item = &'a FileItem>) {
     let agents = scan::home().join("Library/LaunchAgents");
     // SAFETY: getuid has no preconditions.
@@ -1168,7 +1198,12 @@ fn stop_agents<'a>(items: impl Iterator<Item = &'a FileItem>) {
     }
 }
 
+/// Grants outside flatpak's permission store do not exist on Linux, and flatpak apps never go from here.
+#[cfg(target_os = "linux")]
+fn reset_privacy(_app: &InstalledApp) {}
+
 /// Clears the camera, microphone and other privacy grants the app held.
+#[cfg(target_os = "macos")]
 fn reset_privacy(app: &InstalledApp) {
     for id in app.bundle_id.iter().chain(&app.helper_ids) {
         let _ = Command::new("/usr/bin/tccutil").args(["reset", "All", id]).output();
