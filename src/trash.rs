@@ -41,7 +41,7 @@ pub struct Batch {
     pub kind: Kind,
     pub origin: String,
     pub secs: i64,
-    /// The dated folder in the Trash this removal is grouped into.
+    /// Where this removal's items go: a dated folder on macOS, the Trash's files folder on Linux.
     pub folder: PathBuf,
     pub moved: Vec<Move>,
     pub pending: Vec<Move>,
@@ -70,7 +70,7 @@ pub fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs() as i64)
 }
 
-/// Moves the items into one `<origin> — <date>` folder in the Trash.
+/// Moves the items to the Trash: on macOS into one `<origin> — <date>` folder, on Linux each with its own `.trashinfo`.
 pub fn move_to_trash<'a>(items: impl IntoIterator<Item = &'a FileItem>, origin: &str) -> Batch {
     let secs = now();
     let folder = make_folder(origin, secs);
@@ -90,21 +90,25 @@ pub fn move_to_trash<'a>(items: impl IntoIterator<Item = &'a FileItem>, origin: 
                 continue;
             }
         };
-        // shortcut: a rename cannot cross volumes and copying would fill the boot disk; use Finder for external drives.
+        // shortcut: a rename cannot cross volumes and copying would fill the boot disk; the file manager trashes external drives.
         if trash_device.is_some_and(|device| device != meta.dev()) {
             let manager = if cfg!(target_os = "macos") { "Finder" } else { "your file manager" };
             batch.failed.push((item.path.clone(), format!("on another volume, move it to the Trash in {manager}")));
             continue;
         }
         let name = item.path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        #[cfg(target_os = "macos")]
         let to = batch.folder.join(unique_name(&batch.folder, &name, &mut used));
+        #[cfg(target_os = "linux")]
+        let to = match reserve(&batch.folder, &name, &mut used, &item.path, secs) {
+            Ok(to) => to,
+            Err(error) => {
+                batch.failed.push((item.path.clone(), format!("cannot write its .trashinfo: {error}")));
+                continue;
+            }
+        };
         tag(&item.path, origin, secs);
         let next = Move { from: item.path.clone(), to, system: item.system, size: item.size };
-        #[cfg(target_os = "linux")]
-        if let Err(error) = write_info(&next.to, &next.from, secs) {
-            batch.failed.push((next.from, format!("cannot write its .trashinfo: {error}")));
-            continue;
-        }
         match std::fs::rename(&next.from, &next.to) {
             Ok(()) => batch.moved.push(next),
             Err(error) if error.kind() == ErrorKind::PermissionDenied => batch.pending.push(next),
@@ -141,7 +145,9 @@ pub fn restorable(entry: &Entry) -> Vec<Move> {
         let Some(trash) = &file.trash else { continue };
         let lexical = |path: &Path| path.is_absolute() && !path.components().any(|part| part == Component::ParentDir);
         let safe = file.recoverable && lexical(trash) && lexical(&file.original) && is_in_trash(&trash.to_string_lossy()) && !is_protected(&file.original);
-        if safe && std::fs::symlink_metadata(trash).is_ok() && std::fs::symlink_metadata(&file.original).is_err() {
+        // The freedesktop Trash is one flat folder: once emptied, another item can take the name.
+        let same_item = cfg!(target_os = "macos") || info_names(trash, &file.original);
+        if safe && same_item && std::fs::symlink_metadata(trash).is_ok() && std::fs::symlink_metadata(&file.original).is_err() {
             moves.push(Move { from: trash.clone(), to: file.original.clone(), system: file.system, size: 0 });
         }
     }
@@ -227,19 +233,43 @@ fn info_path(trashed: &Path) -> PathBuf {
     info_folder().join(name)
 }
 
-/// Written before the move with create_new, which reserves the name against other trashing programs.
+/// A free name in the Trash, its `.trashinfo` written with create_new, which reserves the name against
+/// other trashing programs. A name one of them took in between moves on to the next.
+#[cfg(target_os = "linux")]
+fn reserve(folder: &Path, name: &str, used: &mut HashSet<String>, original: &Path, secs: i64) -> std::io::Result<PathBuf> {
+    loop {
+        let to = folder.join(unique_name(folder, name, used));
+        match write_info(&to, original, secs) {
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            result => return result.map(|()| to),
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn write_info(trashed: &Path, original: &Path, secs: i64) -> std::io::Result<()> {
-    let t = tm(secs, true);
-    let date = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
-    let text = format!("[Trash Info]\nPath={}\nDeletionDate={date}\n", url_path(original));
-    std::io::Write::write_all(&mut std::fs::File::options().write(true).create_new(true).open(info_path(trashed))?, text.as_bytes())
+    let text = format!("[Trash Info]\nPath={}\nDeletionDate={}\n", url_path(original), iso(&tm(secs, true)));
+    let mut file = std::fs::File::create_new(info_path(trashed))?;
+    std::io::Write::write_all(&mut file, text.as_bytes())
+}
+
+/// Whether the `.trashinfo` beside an item in the Trash still names `original`.
+fn info_names(trashed: &Path, original: &Path) -> bool {
+    let line = format!("Path={}", url_path(original));
+    trashed.parent() == Some(trash_root().as_path()) && std::fs::read_to_string(info_path(trashed)).is_ok_and(|info| info.lines().any(|found| found == line))
 }
 
 /// The spec stores paths URL-escaped.
-#[cfg(target_os = "linux")]
 fn url_path(path: &Path) -> String {
-    path.as_os_str().as_bytes().iter().map(|&byte| if byte.is_ascii_alphanumeric() || b"-._~/".contains(&byte) { char::from(byte).to_string() } else { format!("%{byte:02X}") }).collect()
+    let mut out = String::new();
+    for &byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/".contains(&byte) {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// Drops the `.trashinfo` of an item that left the freedesktop Trash, so file managers stop listing it.
@@ -257,7 +287,9 @@ fn unique_name(folder: &Path, name: &str, used: &mut HashSet<String>) -> String 
     };
     let mut candidate = name.to_owned();
     let mut suffix = 2;
-    while used.contains(&candidate.to_lowercase()) || folder.join(&candidate).exists() || (cfg!(target_os = "linux") && info_path(&folder.join(&candidate)).exists()) {
+    // symlink_metadata: a trashed dangling link still takes its name.
+    let taken = |candidate: &str| std::fs::symlink_metadata(folder.join(candidate)).is_ok() || (cfg!(target_os = "linux") && info_path(&folder.join(candidate)).exists());
+    while used.contains(&candidate.to_lowercase()) || taken(&candidate) {
         candidate = match ext {
             Some(ext) => format!("{stem} ({suffix}).{ext}"),
             None => format!("{stem} ({suffix})"),
@@ -268,7 +300,8 @@ fn unique_name(folder: &Path, name: &str, used: &mut HashSet<String>) -> String 
     candidate
 }
 
-/// Provenance attributes that travel into the Trash: `xattr -p com.rokartur.cleaner.origin <file>`.
+/// Provenance attributes that travel into the Trash: `xattr -p com.rokartur.cleaner.origin <file>`, on
+/// Linux `getfattr -n user.com.rokartur.cleaner.origin <file>`.
 fn tag(path: &Path, origin: &str, secs: i64) {
     let Ok(file) = CString::new(path.as_os_str().as_bytes()) else { return };
     for (name, value) in [(ORIGIN_ATTR, origin.to_owned()), (DATE_ATTR, iso_utc(secs))] {
@@ -301,8 +334,12 @@ fn tm(secs: i64, local: bool) -> libc::tm {
 }
 
 fn iso_utc(secs: i64) -> String {
-    let t = tm(secs, false);
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec)
+    format!("{}Z", iso(&tm(secs, false)))
+}
+
+/// `2026-06-03T14:30:05`, without a zone.
+fn iso(t: &libc::tm) -> String {
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec)
 }
 
 /// `2026-06-03 at 14.30.05` for Trash folder names, `2026-06-03 14:30` for display.
@@ -486,6 +523,34 @@ mod tests {
     fn trash_info_paths_are_url_escaped() {
         assert_eq!(url_path(Path::new("/home/a/My File%.txt")), "/home/a/My%20File%25.txt");
         assert_eq!(url_path(Path::new("/home/a/zażółć")), "/home/a/za%C5%BC%C3%B3%C5%82%C4%87");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_flat_trash_never_mixes_up_items_that_share_a_name() {
+        let files = trash_root();
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::create_dir_all(info_folder()).unwrap();
+        // A .trashinfo another program wrote keeps its name taken even without the item.
+        std::fs::write(info_path(&files.join("taken")), "").unwrap();
+        assert_eq!(unique_name(&files, "taken", &mut HashSet::new()), "taken (2)");
+
+        // An emptied Trash lets another item take the name: the old record no longer restores it.
+        let original = files.parent().unwrap().join("config/shared");
+        std::fs::write(files.join("shared"), "another item").unwrap();
+        let record = FileRecord { original: original.clone(), trash: Some(files.join("shared")), system: false, recoverable: true };
+        let entry = Entry { secs: None, origin: String::new(), count: 1, bytes: 0, paths: vec![], files: vec![record] };
+        assert!(restorable(&entry).is_empty());
+        write_info(&files.join("shared"), &original, 0).unwrap();
+        assert_eq!(restorable(&entry).len(), 1);
+
+        // A move sudo never made leaves no .trashinfo behind.
+        let pending = Move { from: files.parent().unwrap().join("still-here"), to: files.join("never-moved"), system: true, size: 0 };
+        std::fs::write(&pending.from, "x").unwrap();
+        write_info(&pending.to, &pending.from, 0).unwrap();
+        let batch = Batch { kind: Kind::Trash, origin: "Test".into(), secs: 0, folder: files.clone(), moved: vec![], pending: vec![pending.clone()], failed: vec![], skipped: 0 };
+        finish(batch);
+        assert!(!info_path(&pending.to).exists());
     }
 
     #[test]

@@ -8,7 +8,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::collections::HashSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{SendError, Sender};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1040,7 +1040,7 @@ impl App {
             self.status = "No web page to open.".into();
             return;
         }
-        launch(Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" }).arg(url));
+        launch(Command::new(OPENER).arg(url));
     }
 
     fn remove_selected(&mut self, target: Target) {
@@ -1051,7 +1051,8 @@ impl App {
         };
         if let (Target::Leftovers, Some(app)) = (target, &self.opened) {
             stop_agents(self.leftovers.selected());
-            if self.leftovers.selected().any(|item| item.path == app.path) {
+            // Linux has no per-app grants outside flatpak's own store.
+            if cfg!(target_os = "macos") && self.leftovers.selected().any(|item| item.path == app.path) {
                 reset_privacy(app);
             }
         }
@@ -1156,19 +1157,24 @@ fn step(cursor: usize, count: usize, code: KeyCode) -> usize {
     }
 }
 
-/// Shows the item in its folder: Finder selects it, Linux has no common way to select, so its folder opens.
+const OPENER: &str = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+
+/// Shows the item: Finder selects it in its folder. xdg-open cannot select, so it opens a folder
+/// itself and a file's parent folder.
 fn reveal(path: &Path) {
     if cfg!(target_os = "macos") {
-        launch(Command::new("open").arg("-R").arg(path));
-    } else if let Some(folder) = path.parent() {
-        launch(Command::new("xdg-open").arg(folder));
+        launch(Command::new(OPENER).arg("-R").arg(path));
+        return;
+    }
+    let folder = if path.is_dir() { Some(path) } else { path.parent() };
+    if let Some(folder) = folder {
+        launch(Command::new(OPENER).arg(folder));
     }
 }
 
 /// Starts a desktop helper without a word on the TUI (xdg-open passes on its helpers' warnings) and
 /// reaps it on a thread of its own, which ends with the helper.
 fn launch(command: &mut Command) {
-    use std::process::Stdio;
     if let Ok(mut child) = command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
         std::thread::spawn(move || child.wait());
     }
@@ -1180,7 +1186,8 @@ fn stop_agents<'a>(items: impl Iterator<Item = &'a FileItem>) {
     let units = scan::xdg("XDG_CONFIG_HOME", ".config").join("systemd/user");
     for item in items.filter(|item| item.path.parent() == Some(units.as_path())) {
         if let Some(unit) = item.path.file_name() {
-            let _ = Command::new("systemctl").args(["--user", "disable", "--now", "--"]).arg(unit).output();
+            // --no-block: a unit's stop timeout (90 s by default) would freeze the TUI.
+            let _ = Command::new("systemctl").args(["--user", "disable", "--now", "--no-block", "--"]).arg(unit).output();
         }
     }
 }
@@ -1198,12 +1205,7 @@ fn stop_agents<'a>(items: impl Iterator<Item = &'a FileItem>) {
     }
 }
 
-/// Grants outside flatpak's permission store do not exist on Linux, and flatpak apps never go from here.
-#[cfg(target_os = "linux")]
-fn reset_privacy(_app: &InstalledApp) {}
-
 /// Clears the camera, microphone and other privacy grants the app held.
-#[cfg(target_os = "macos")]
 fn reset_privacy(app: &InstalledApp) {
     for id in app.bundle_id.iter().chain(&app.helper_ids) {
         let _ = Command::new("/usr/bin/tccutil").args(["reset", "All", id]).output();

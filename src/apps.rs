@@ -21,10 +21,10 @@ pub struct App {
     pub executable: Option<String>,
     /// Bundle ids of login items, plug-ins and XPC services: their files belong to this app.
     pub helper_ids: Vec<String>,
-    /// Apple's own SIP-protected bundles, never removable.
+    /// The OS owns the app itself: Apple's SIP bundles on macOS, a package manager's on Linux. Only its leftovers go.
     pub is_system: bool,
     pub version: Option<String>,
-    /// Bundle size on disk, None until measured after listing.
+    /// Size on disk of what `payload` names, None until measured after listing.
     pub size: Option<u64>,
     /// Seconds since the epoch the bundle was created here, close to its install date.
     pub installed: i64,
@@ -34,8 +34,14 @@ impl App {
     pub fn descriptor(&self) -> Descriptor {
         let file_name = self.path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
         let ids = self.bundle_id.iter().chain(&self.helper_ids).map(String::as_str);
-        let names = [Some(self.name.as_str()), self.bundle_name.as_deref(), Some(file_name.as_str()), self.executable.as_deref()];
+        let names = [self.name_term(), self.bundle_name.as_deref(), Some(file_name.as_str()), self.executable.as_deref()];
         Descriptor::new(ids, names.into_iter().flatten())
+    }
+
+    /// The display name as a match term. A Linux app with a desktop id goes without it: GNOME and KDE
+    /// name theirs Fonts, Files or Settings, which would select `~/.local/share/fonts`.
+    pub fn name_term(&self) -> Option<&str> {
+        (cfg!(target_os = "macos") || self.bundle_id.is_none()).then_some(self.name.as_str())
     }
 }
 
@@ -60,8 +66,8 @@ pub fn installed() -> Vec<App> {
     apps
 }
 
-#[cfg(target_os = "macos")]
 /// Every `.app` at or below `folder`, never descending into a bundle.
+#[cfg(target_os = "macos")]
 fn find_bundles(folder: &Path, depth: usize, found: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(folder) else { return };
     for entry in entries.flatten() {
@@ -108,9 +114,9 @@ fn info_plist(bundle: &Path) -> Option<plist::Dictionary> {
     value.into_dictionary()
 }
 
-#[cfg(target_os = "macos")]
 /// Everything under `/System/`, plus built-ins Apple links into `/Applications` from a cryptex
 /// (Safari). The flag sits on the link itself; an unreadable bundle counts as system.
+#[cfg(target_os = "macos")]
 fn is_system_bundle(path: &Path) -> bool {
     path.starts_with("/System/") || std::fs::symlink_metadata(path).map_or(true, |meta| meta.st_flags() & SF_RESTRICTED != 0)
 }
@@ -148,22 +154,50 @@ pub fn payload(app: &App) -> PathBuf {
 
 #[cfg(target_os = "linux")]
 pub fn payload(app: &App) -> PathBuf {
-    let home = crate::scan::home();
-    let flatpak = app.bundle_id.iter().flat_map(|id| [Path::new("/var/lib/flatpak/app").join(id), home.join(".local/share/flatpak/app").join(id)]).find(|path| path.is_dir());
-    let program = || launcher_program(&app.path).and_then(|program| which(&program)).and_then(|path| std::fs::canonicalize(path).ok()).filter(|path| path.is_file() && !is_wrapper(path));
-    flatpak.or_else(program).unwrap_or_else(|| app.path.clone())
+    let flatpak = app.bundle_id.iter().flat_map(|id| flatpak_roots().into_iter().map(move |root| root.join(id))).find(|path| path.is_dir());
+    flatpak.or_else(|| launched_file(app)).unwrap_or_else(|| app.path.clone())
+}
+
+/// The file the launcher starts. A wrapper is skipped before its link is followed: `steam` resolves
+/// to `bin_steam.sh`, which no longer reads as one.
+#[cfg(target_os = "linux")]
+fn launched_file(app: &App) -> Option<PathBuf> {
+    let program = launcher_program(&app.path)?;
+    if is_wrapper(Path::new(&program)) {
+        return None;
+    }
+    let path = std::fs::canonicalize(which(&program)?).ok()?;
+    path.is_file().then_some(path)
+}
+
+/// The `app` folders of every flatpak installation: system, user, and the extra ones an
+/// `installations.d` file declares (an SD card on the Steam Deck).
+#[cfg(target_os = "linux")]
+pub fn flatpak_roots() -> Vec<PathBuf> {
+    let user = std::env::var_os("FLATPAK_USER_DIR").map_or_else(|| crate::scan::xdg("XDG_DATA_HOME", ".local/share").join("flatpak"), PathBuf::from);
+    let mut roots = vec![PathBuf::from("/var/lib/flatpak"), user];
+    for entry in std::fs::read_dir("/etc/flatpak/installations.d").into_iter().flatten().flatten() {
+        let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+        roots.extend(text.lines().filter_map(|line| line.trim().strip_prefix("Path=")).map(PathBuf::from));
+    }
+    roots.into_iter().map(|root| root.join("app")).collect()
+}
+
+/// Where the user's own launchers live; everything else in the menu a package manager installed.
+#[cfg(target_os = "linux")]
+pub fn user_launchers() -> PathBuf {
+    crate::scan::xdg("XDG_DATA_HOME", ".local/share").join("applications")
 }
 
 /// Folders of desktop entries, the user's first: an entry id found twice keeps the first, as menus do.
 #[cfg(target_os = "linux")]
 fn desktop_folders() -> Vec<PathBuf> {
-    let home = crate::scan::home();
     let data_dirs = std::env::var("XDG_DATA_DIRS").ok().filter(|dirs| !dirs.is_empty()).unwrap_or_else(|| "/usr/local/share:/usr/share".into());
-    let mut roots = vec![home.join(".local/share")];
-    roots.extend(std::env::split_paths(&data_dirs));
-    roots.extend([home.join(".local/share/flatpak/exports/share"), "/var/lib/flatpak/exports/share".into(), "/var/lib/snapd/desktop".into()]);
-    let mut folders: Vec<PathBuf> = Vec::new();
-    for folder in roots.into_iter().map(|root| root.join("applications")) {
+    let mut folders = vec![user_launchers()];
+    let mut shares: Vec<PathBuf> = std::env::split_paths(&data_dirs).collect();
+    shares.extend(flatpak_roots().iter().filter_map(|apps| Some(apps.parent()?.join("exports/share"))));
+    shares.push("/var/lib/snapd/desktop".into());
+    for folder in shares.into_iter().map(|share| share.join("applications")) {
         if !folders.contains(&folder) {
             folders.push(folder);
         }
@@ -171,26 +205,48 @@ fn desktop_folders() -> Vec<PathBuf> {
     folders
 }
 
-/// Every app with a menu entry. Package managers own the ones outside the home folder, so those count
-/// as system: their leftovers can go, the app itself goes with `dnf`, `apt`, `flatpak` or `snap`.
+/// Every app with a menu entry. Package managers own the ones outside the user's launchers, so those
+/// count as system: their leftovers can go, the app itself goes with `dnf`, `apt`, `flatpak` or `snap`.
 #[cfg(target_os = "linux")]
 pub fn installed() -> Vec<App> {
-    let mut seen = HashSet::new();
-    let mut apps = Vec::new();
+    let mut apps: Vec<App> = Vec::new();
+    // Desktop file id to the index of its app, None when the first entry was hidden.
+    let mut first: std::collections::HashMap<String, Option<usize>> = std::collections::HashMap::new();
     for folder in desktop_folders() {
-        let Ok(entries) = std::fs::read_dir(&folder) else { continue };
-        let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).filter(|path| path.extension().is_some_and(|ext| ext == "desktop")).collect();
-        paths.sort();
-        for path in paths {
-            if seen.insert(path.file_name().map(std::ffi::OsStr::to_os_string))
-                && let Some(app) = read(&path)
-            {
-                apps.push(app);
+        let mut entries = Vec::new();
+        desktop_files(&folder, "", &mut entries);
+        entries.sort();
+        for (id, path) in entries {
+            if let Some(&shadowed) = first.get(&id) {
+                // A user copy of a package's launcher (edited flags) does not make the app the user's.
+                if let Some(index) = shadowed {
+                    apps[index].is_system = true;
+                }
+                continue;
             }
+            let app = read(&path);
+            first.insert(id, app.is_some().then_some(apps.len()));
+            apps.extend(app);
         }
     }
     apps.sort_by_cached_key(|app| app.name.to_lowercase());
     apps
+}
+
+/// The desktop entries below `folder` with their desktop file ids: `wine/Programs/Foo.desktop` is
+/// `wine-Programs-Foo.desktop`. Linked folders are never entered.
+#[cfg(target_os = "linux")]
+pub fn desktop_files(folder: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) {
+    let Ok(entries) = std::fs::read_dir(folder) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            desktop_files(&path, &format!("{prefix}{name}-"), out);
+        } else if name.ends_with(".desktop") {
+            out.push((format!("{prefix}{name}"), path));
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -202,20 +258,22 @@ pub fn read(path: &Path) -> Option<App> {
     }
     let stem = path.file_stem()?.to_string_lossy().into_owned();
     // A desktop file id is reverse DNS when the app has one (org.kde.dolphin), as is every flatpak's.
-    let reverse_dns = stem.matches('.').count() >= 2 && !stem.contains(char::is_whitespace);
-    let bundle_id = field("X-Flatpak").map(str::to_owned).or(reverse_dns.then(|| stem.clone()));
+    let bundle_id = field("X-Flatpak").map(str::to_owned).or_else(|| is_reverse_dns(&stem).then(|| stem.clone()));
     let name = field("Name").map_or(stem, str::to_owned);
-    let executable = field("Exec").and_then(exec_program).filter(|program| !is_wrapper(Path::new(program))).and_then(|program| Some(Path::new(&program).file_name()?.to_string_lossy().into_owned()));
-    let meta = std::fs::metadata(path).ok();
-    let created = meta.and_then(|meta| meta.created().or_else(|_| meta.modified()).ok());
+    let program = field("Exec").and_then(exec_program);
+    // Steam, Lutris and Heroic write launchers for the games they installed: the game goes with them.
+    let wrapped = program.as_deref().is_some_and(|program| is_wrapper(Path::new(program)));
+    let executable = program.filter(|_| !wrapped).as_deref().map(Path::new).and_then(Path::file_name).map(|name| name.to_string_lossy().into_owned());
+    let created = std::fs::metadata(path).and_then(|meta| meta.created().or_else(|_| meta.modified()));
+    let installed = created.ok().and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |elapsed| elapsed.as_secs() as i64);
     Some(App {
-        is_system: !path.starts_with(crate::scan::home().join(".local/share/applications")),
+        is_system: wrapped || !path.starts_with(user_launchers()),
         bundle_name: field("StartupWMClass").filter(|class| *class != name && !is_wrapper(Path::new(class))).map(str::to_owned),
         executable,
         helper_ids: vec![],
         version: None,
         size: None,
-        installed: created.and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |elapsed| elapsed.as_secs() as i64),
+        installed,
         path: path.to_path_buf(),
         bundle_id,
         name,
@@ -264,11 +322,13 @@ fn unescape(value: &str) -> String {
     out
 }
 
-/// The program an Exec line starts, as written: quotes removed, `env` and its variables skipped.
+/// The program an Exec line starts, as written: quotes removed, `env` with its options and variables skipped.
 #[cfg(target_os = "linux")]
 pub fn exec_program(exec: &str) -> Option<String> {
     let mut words = Vec::new();
-    let (mut word, mut quoted, mut chars) = (None::<String>, false, exec.chars());
+    let mut word: Option<String> = None;
+    let mut quoted = false;
+    let mut chars = exec.chars();
     while let Some(c) = chars.next() {
         match c {
             '"' => {
@@ -286,26 +346,41 @@ pub fn exec_program(exec: &str) -> Option<String> {
     let mut words = words.into_iter().peekable();
     if words.peek().is_some_and(|first| Path::new(first).file_name().is_some_and(|name| name == "env")) {
         words.next();
-        while words.next_if(|word| word.contains('=') || word.starts_with('-')).is_some() {}
+        while let Some(option) = words.next_if(|word| word.contains('=') || word.starts_with('-')) {
+            // These options take the next word as their value: `env -u WAYLAND_DISPLAY app`.
+            if matches!(option.as_str(), "-u" | "--unset" | "-C" | "--chdir" | "-S" | "--split-string") {
+                words.next();
+            }
+        }
     }
     words.next().filter(|program| !program.is_empty())
 }
 
-/// The Exec program of a launcher file.
 #[cfg(target_os = "linux")]
 pub fn launcher_program(desktop: &Path) -> Option<String> {
     let entry = desktop_entry(desktop)?;
     entry.iter().find(|(key, _)| key == "Exec").and_then(|(_, exec)| exec_program(exec))
 }
 
-/// A program as the session would find it: an absolute path as is, a bare name on PATH.
+/// A user file that switches a package's unit or autostart entry off: a mask linked to /dev/null, or an
+/// entry with `Hidden=true`. Trashing it turns the package's own back on at the next login.
 #[cfg(target_os = "linux")]
+pub fn is_override(path: &Path) -> bool {
+    let masked = std::fs::read_link(path).is_ok_and(|target| target == Path::new("/dev/null"));
+    let off = |(key, value): &(String, String)| (key == "Hidden" && value == "true") || (key == "X-GNOME-Autostart-enabled" && value == "false");
+    masked || desktop_entry(path).is_some_and(|entry| entry.iter().any(off))
+}
+
+/// A program as the session would find it: an absolute path as is, a bare name on PATH.
 pub fn which(program: &str) -> Option<PathBuf> {
     if program.starts_with('/') {
         return std::fs::symlink_metadata(program).is_ok().then(|| PathBuf::from(program));
     }
+    if program.contains('/') {
+        return None;
+    }
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|folder| folder.join(program)).find(|candidate| !program.contains('/') && candidate.is_file())
+    std::env::split_paths(&path).map(|folder| folder.join(program)).find(|candidate| candidate.is_file())
 }
 
 /// Programs that start other programs: their name says nothing about the app, and `steam` or
@@ -313,8 +388,8 @@ pub fn which(program: &str) -> Option<PathBuf> {
 #[cfg(target_os = "linux")]
 fn is_wrapper(program: &Path) -> bool {
     const WRAPPERS: &[&str] = &[
-        "env",
         "flatpak",
+        "flatpak-spawn",
         "snap",
         "sh",
         "bash",
@@ -342,17 +417,44 @@ fn is_wrapper(program: &Path) -> bool {
         "sudo",
         "pkexec",
         "gamemoderun",
+        "gamescope",
+        "mangohud",
         "prime-run",
+        "optirun",
+        "primusrun",
         "firejail",
         "bwrap",
+        "distrobox-enter",
+        "systemd-run",
+        "nice",
+        "taskset",
     ];
     program.file_name().is_some_and(|name| WRAPPERS.contains(&name.to_string_lossy().to_lowercase().as_str()))
 }
 
+/// Whether a name is an identifier such as `com.foo.Bar`. On Linux `mimeapps.list` and `dnf5.log.1`
+/// have dots too, so there it also needs three parts and a top-level domain of 2 to 6 lowercase
+/// letters first (com, org, io, design).
+pub fn is_reverse_dns(text: &str) -> bool {
+    if cfg!(target_os = "linux") {
+        let mut parts = text.split('.');
+        let tld = parts.next().unwrap_or_default();
+        return (2..=6).contains(&tld.len()) && tld.bytes().all(|byte| byte.is_ascii_lowercase()) && parts.count() >= 2 && !text.contains(char::is_whitespace);
+    }
+    text.find('.').is_some_and(|dot| dot > 0)
+}
+
 /// Trashed files are already on their way out and never count as installed or as leftovers.
-/// `~/.local/share/Trash` and `<volume>/.Trash-<uid>` are the freedesktop Trash folders.
 pub fn is_in_trash(path: &str) -> bool {
-    path.contains("/.Trash/") || path.contains("/.Trashes/") || path.ends_with("/.Trash") || path.ends_with("/.Trashes") || path.contains("/.local/share/Trash/") || path.contains("/.Trash-")
+    let finder = path.contains("/.Trash/") || path.contains("/.Trashes/") || path.ends_with("/.Trash") || path.ends_with("/.Trashes");
+    finder || (cfg!(target_os = "linux") && in_freedesktop_trash(path))
+}
+
+/// The freedesktop Trash: the user's in `~/.local/share/Trash`, a volume's in `<volume>/.Trash-<uid>`.
+fn in_freedesktop_trash(path: &str) -> bool {
+    // SAFETY: getuid has no preconditions.
+    let volume = format!("/.Trash-{}", unsafe { libc::getuid() });
+    Path::new(path).starts_with(crate::scan::home().join(".local/share/Trash")) || path.contains(&format!("{volume}/")) || path.ends_with(&volume)
 }
 
 /// Who owns an identifier or a folder name, for the orphan scan.
@@ -417,6 +519,45 @@ mod tests {
         assert_eq!(exec_program(r#""/a/say \"hi\"" %f"#).as_deref(), Some(r#"/a/say "hi""#));
         assert_eq!(exec_program("env DESKTOPINTEGRATION=1 '/home/a/My App.appimage' %U").as_deref(), Some("/home/a/My App.appimage"));
         assert_eq!(exec_program("  "), None);
+        assert_eq!(exec_program("env -u WAYLAND_DISPLAY /opt/x/x %U").as_deref(), Some("/opt/x/x"));
+        assert_eq!(exec_program("/usr/bin/env -C /opt/x ./run").as_deref(), Some("./run"));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_app() -> App {
+        App {
+            path: "/usr/share/applications/x.desktop".into(),
+            bundle_id: None,
+            name: String::new(),
+            bundle_name: None,
+            executable: None,
+            helper_ids: vec![],
+            is_system: true,
+            version: None,
+            size: None,
+            installed: 0,
+        }
+    }
+
+    #[test]
+    fn freedesktop_trash_is_the_user_s_own() {
+        assert!(is_in_trash("/Users/a/.Trash/Foo.app"));
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        let volume = format!("/mnt/disk/.Trash-{uid}/files/x");
+        assert_eq!(is_in_trash(&volume), cfg!(target_os = "linux"), "only Linux has freedesktop Trash folders");
+        assert!(!is_in_trash("/tmp/.Trash-x/payload"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn desktop_ids_stay_out_of_name_matching() {
+        let app = App { bundle_id: Some("org.gnome.font-viewer".into()), name: "Fonts".into(), ..test_app() };
+        assert_eq!(crate::matcher::classify("fonts", &app.descriptor()), None, "~/.local/share/fonts is not the app's");
+        let id_less = App { bundle_id: None, name: "Fonts".into(), ..test_app() };
+        assert!(crate::matcher::classify("fonts", &id_less.descriptor()).is_some());
+        let flathub = App { bundle_id: Some("io.github.someone.Tool".into()), ..test_app() };
+        assert!(!flathub.descriptor().vendor_tokens().contains(&"github"));
     }
 
     #[test]
@@ -435,6 +576,19 @@ mod tests {
         assert_eq!((flatpak.bundle_id.as_deref(), flatpak.executable), (Some("com.brave.Browser"), None));
         assert!(entry("hidden.desktop", "Name=Hidden\nNoDisplay=true\nExec=hidden").is_none());
         assert!(entry("emacs-29.1.desktop", "Name=Emacs\nExec=emacs").is_some_and(|app| app.bundle_id.is_none()));
+        assert!(entry("blender-4.1.1.desktop", "Name=Blender\nExec=blender").is_some_and(|app| app.bundle_id.is_none()), "a version is not reverse DNS");
+        let game = entry("Terraria.desktop", "Name=Terraria\nExec=steam steam://rungameid/105600").unwrap();
+        assert!(game.executable.is_none(), "steam names no app");
+        std::fs::write(root.join("masked.service"), "").unwrap();
+        std::os::unix::fs::symlink("/dev/null", root.join("mask.service")).unwrap();
+        assert!(is_override(&root.join("mask.service")) && !is_override(&root.join("masked.service")));
+        std::fs::write(root.join("off.desktop"), "[Desktop Entry]\nType=Application\nHidden=true\n").unwrap();
+        assert!(is_override(&root.join("off.desktop")));
+        std::fs::create_dir_all(root.join("wine/Programs")).unwrap();
+        std::fs::write(root.join("wine/Programs/Foo.desktop"), "").unwrap();
+        let mut found = Vec::new();
+        desktop_files(&root, "", &mut found);
+        assert!(found.iter().any(|(id, _)| id == "wine-Programs-Foo.desktop"));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

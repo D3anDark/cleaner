@@ -1,14 +1,10 @@
 use std::collections::HashSet;
 #[cfg(target_os = "macos")]
 use std::ffi::OsStr;
-#[cfg(target_os = "macos")]
 use std::fs::{File, OpenOptions};
-#[cfg(target_os = "macos")]
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
-#[cfg(target_os = "macos")]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -55,6 +51,7 @@ pub fn sizes(paths: &[PathBuf]) -> Vec<(u64, bool)> {
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
+                #[cfg(target_os = "macos")]
                 let mut buffer = vec![0u8; 64 * 1024];
                 loop {
                     let mut state = queue.lock().unwrap();
@@ -71,7 +68,10 @@ pub fn sizes(paths: &[PathBuf]) -> Vec<(u64, bool)> {
                     drop(state);
 
                     let mut found = Vec::new();
+                    #[cfg(target_os = "macos")]
                     let (bytes, readable) = read_folder(&folder, &mut buffer, &mut found, &linked);
+                    #[cfg(target_os = "linux")]
+                    let (bytes, readable) = read_folder(&folder, &mut found, &linked);
                     totals[folder.item].fetch_add(bytes, Ordering::Relaxed);
                     if !readable {
                         complete[folder.item].store(false, Ordering::Relaxed);
@@ -159,24 +159,31 @@ fn read_folder(folder: &Folder, buffer: &mut [u8], found: &mut Vec<Folder>, link
     }
 }
 
-/// Linux has no bulk call: `readdir`, then one `lstat` per entry. The buffer is the macOS one, never touched here.
+/// Linux has no bulk call: `readdir`, then one `lstat` per entry. The folder is read through the
+/// descriptor O_NOFOLLOW opened, so one swapped for a link in between is never followed.
 #[cfg(target_os = "linux")]
-fn read_folder(folder: &Folder, _buffer: &mut [u8], found: &mut Vec<Folder>, linked: &Mutex<HashSet<(usize, u64)>>) -> (u64, bool) {
-    match std::fs::symlink_metadata(&folder.path) {
-        Ok(meta) if meta.is_dir() && meta.dev() == folder.device => {}
-        Ok(_) => return (0, true),
-        Err(_) => return (0, false),
+fn read_folder(folder: &Folder, found: &mut Vec<Folder>, linked: &Mutex<HashSet<(usize, u64)>>) -> (u64, bool) {
+    let Ok(dir) = OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(&folder.path) else { return (0, false) };
+    let Ok(meta) = File::metadata(&dir) else { return (0, false) };
+    if meta.dev() != folder.device {
+        return (0, true);
     }
-    let Ok(entries) = std::fs::read_dir(&folder.path) else { return (0, false) };
+    // Without /proc (a bare chroot) the path is read again, as before the descriptor.
+    let entries = std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd())).or_else(|_| std::fs::read_dir(&folder.path));
+    let Ok(entries) = entries else { return (0, false) };
     let (mut bytes, mut readable) = (0, true);
     for entry in entries {
+        let Ok(entry) = entry else {
+            readable = false;
+            continue;
+        };
         // DirEntry::metadata does not follow links on Unix, so a link counts 0.
-        let Ok((path, meta)) = entry.and_then(|entry| Ok((entry.path(), entry.metadata()?))) else {
+        let Ok(meta) = entry.metadata() else {
             readable = false;
             continue;
         };
         if meta.is_dir() {
-            found.push(Folder { item: folder.item, path, device: folder.device });
+            found.push(Folder { item: folder.item, path: folder.path.join(entry.file_name()), device: folder.device });
         } else if meta.is_file() && (meta.nlink() < 2 || linked.lock().unwrap().insert((folder.item, meta.ino()))) {
             bytes += meta.blocks() * 512;
         }
